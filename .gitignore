@@ -1,0 +1,14 @@
+# Secrets — NEVER commit these
+.env
+traefik/certs/
+authelia/config/notifications.txt
+
+# Backups
+backups/
+
+# WireGuard runtime (managed via Docker volume, not in repo)
+wireguard/
+
+# OS files
+.DS_Store
+Thumbs.db
