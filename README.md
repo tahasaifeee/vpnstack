@@ -2,6 +2,43 @@
 
 A production-ready, self-hosted VPN stack combining **WireGuard** (via wg-easy), **Authelia** (TOTP/2FA), **Traefik** (reverse proxy + TLS), **PostgreSQL**, and **Redis** — all in Docker Compose.
 
+---
+
+## One-Click Install
+
+Run this on any fresh Linux server — the installer handles everything interactively:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tahasaifeee/vpnstack/main/install.sh | sudo bash
+```
+
+Or with `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/tahasaifeee/vpnstack/main/install.sh | sudo bash
+```
+
+**Supported OS:** Ubuntu 20+, Debian 11+, AlmaLinux 8/9, Rocky Linux 8/9, RHEL 8/9, CentOS Stream, Fedora
+
+The installer will ask you:
+
+| Question | Default |
+|---|---|
+| Base domain (e.g. `example.com`) | — |
+| Server public IP / hostname | Auto-detected |
+| Timezone | System timezone |
+| Admin username & password | `admin` |
+| Enable TOTP two-factor auth? | Yes |
+| TLS method (Let's Encrypt or self-signed) | Let's Encrypt |
+| WireGuard DNS servers | `1.1.1.1, 8.8.8.8` |
+| Configure firewall automatically? | Yes |
+
+It then generates all config files, hashes your password with Argon2id, issues/downloads TLS certs, and starts the full stack — no manual editing required.
+
+> **Custom install directory:** `VPNSTACK_DIR=/your/path curl ... | sudo bash`
+
+---
+
 ## Architecture
 
 ```
@@ -27,244 +64,188 @@ Internet User
     └── VPN Clients (phones, laptops, etc.)
 ```
 
+**Networks:**
+- `proxy` — Traefik, wg-easy, Authelia (internet-facing)
+- `vpn_internal` — PostgreSQL, Redis (no direct internet access)
+
+---
+
 ## Prerequisites
 
-- Docker Engine 24+ and Docker Compose v2
-- A server with a public IP or DDNS hostname
-- UDP port **51820** open in your firewall (for WireGuard clients)
-- TCP ports **80** and **443** open (for Traefik/admin panel)
-- Linux kernel with WireGuard support (any modern kernel ≥5.6)
+- A fresh Linux server with a **public IP** (or DDNS hostname)
+- Ports open in your cloud/host firewall:
+  - `80/tcp` — HTTP (used by Let's Encrypt challenge)
+  - `443/tcp` — HTTPS (Traefik + admin panel)
+  - `51820/udp` — WireGuard VPN tunnel
+- Linux kernel ≥ 5.6 (WireGuard built-in; all modern distros qualify)
+- Docker and Docker Compose are installed **automatically** by the installer
 
-## Quick Start
+---
 
-### 1. Clone and Configure
+## After Installation
 
-```bash
-git clone <your-repo> vpn-stack
-cd vpn-stack
+### DNS Records
 
-# Create and edit your .env file
-cp .env.example .env
-nano .env
-```
+Create three A records pointing to your server IP:
 
-Edit `.env` and set at minimum:
-```bash
-DOMAIN=vpn.yourdomain.com          # Your base domain
-VPN_HOST=203.0.113.10              # Your server's public IP
-TZ=Asia/Dubai
-```
+| Record | Type | Value |
+|---|---|---|
+| `vpn.yourdomain.com` | A | YOUR_SERVER_IP |
+| `auth.yourdomain.com` | A | YOUR_SERVER_IP |
+| `traefik.yourdomain.com` | A | YOUR_SERVER_IP |
 
-### 2. Generate Secrets
+### First Login
 
-```bash
-chmod +x scripts/manage.sh
-./scripts/manage.sh init           # Auto-generates secrets in .env
-```
+1. Open `https://vpn.yourdomain.com`
+2. You're redirected to `https://auth.yourdomain.com`
+3. Log in with your admin username and password
+4. If TOTP is enabled: scan the QR code with **Google Authenticator** (or Authy/1Password)
+5. Enter the 6-digit code — you're now in the **wg-easy admin panel**
+6. Click **"+ New Client"** to create your first VPN peer
 
-### 3. Set Up Your Admin Password
+---
 
-```bash
-# Generate a password hash
-./scripts/manage.sh hash-password 'YourStrongPassword123!'
-```
+## Stack Management
 
-Copy the `$argon2id$...` hash into `authelia/config/users_database.yml`:
-
-```yaml
-users:
-  admin:
-    disabled: false
-    displayname: "VPN Admin"
-    password: "$argon2id$v=19$..."   # ← paste hash here
-    email: admin@yourdomain.com
-    groups:
-      - vpn-admins
-```
-
-### 4. DNS Setup
-
-Create these DNS records pointing to your server IP:
-
-| Subdomain            | Type | Value         |
-|----------------------|------|---------------|
-| `vpn.yourdomain.com`    | A    | YOUR_SERVER_IP |
-| `auth.yourdomain.com`   | A    | YOUR_SERVER_IP |
-| `traefik.yourdomain.com`| A    | YOUR_SERVER_IP |
-
-### 5. TLS Certificates
-
-**Option A — Let's Encrypt (recommended for public domains):**
-
-Uncomment the ACME lines in `docker-compose.yml` under the Traefik command:
-```yaml
-- "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
-- "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
-- "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-```
-Then add `tls: { certResolver: letsencrypt }` to each router in labels.
-
-**Option B — Self-signed (internal/testing):**
-```bash
-openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout traefik/certs/key.pem \
-  -out traefik/certs/cert.pem \
-  -days 365 -subj "/CN=*.yourdomain.com"
-```
-Uncomment the `certificates` block in `traefik/config/tls.yml`.
-
-### 6. Deploy
+The installer creates a `vpnstack` command available system-wide:
 
 ```bash
-./scripts/manage.sh up
-./scripts/manage.sh status
+vpnstack up                                          # Start the stack
+vpnstack down                                        # Stop the stack
+vpnstack restart                                     # Restart all services
+vpnstack status                                      # Health check all containers
+vpnstack logs [service]                              # Follow logs (all or specific)
+vpnstack add-user <name> <email> <pass> <group>     # Add Authelia user
+vpnstack hash-password 'MyPassword123!'             # Generate Argon2id hash
+vpnstack totp-reset <username>                       # Force TOTP re-enrollment
+vpnstack backup                                      # Backup volumes + config files
+vpnstack update                                      # Pull latest images & restart
 ```
 
-### 7. First Login & TOTP Registration
+Direct Docker Compose commands also work from the install directory (default `/opt/vpnstack`):
 
-1. Browse to `https://vpn.yourdomain.com`
-2. You'll be redirected to `https://auth.yourdomain.com`
-3. Log in with your username/password
-4. Authelia will ask to **register a TOTP device**
-5. Scan the QR code with **Google Authenticator** (or any TOTP app)
-6. Enter the 6-digit code to confirm
-7. You're now at the **wg-easy admin panel** — create your first VPN peer!
+```bash
+cd /opt/vpnstack
+docker compose up -d
+docker compose logs -f traefik
+docker compose ps
+```
 
 ---
 
 ## User Management
 
-### Add a New Admin/User
+### Add a user
 
 ```bash
-./scripts/manage.sh add-user john john@company.com 'Password123!' vpn-admins
+vpnstack add-user john john@company.com 'Password123!' vpn-admins
 ```
 
-Or manually edit `authelia/config/users_database.yml` — changes are **hot-reloaded** (no restart needed).
+Changes are **hot-reloaded** by Authelia — no restart needed.
 
-### Reset a User's TOTP
+### Disable a user (without deleting)
 
-If a user loses their authenticator app:
-```bash
-./scripts/manage.sh totp-reset john
-```
-The user will be prompted to register a new TOTP device on their next login.
-
-### Disable a User (without deleting)
+Edit `/opt/vpnstack/authelia/config/users_database.yml`:
 
 ```yaml
 users:
   john:
-    disabled: true    # ← blocks login immediately (hot-reloaded)
+    disabled: true    # ← blocks login immediately
 ```
+
+### Reset a user's TOTP
+
+If a user loses their authenticator app:
+
+```bash
+vpnstack totp-reset john
+```
+
+They'll be prompted to register a new TOTP device on next login.
 
 ---
 
 ## WireGuard Client Setup
 
-1. Log in to `https://vpn.yourdomain.com` (requires TOTP)
-2. Click **"+ New Client"** and name it (e.g., `john-laptop`)
-3. Download the `.conf` file or scan the QR code with the WireGuard mobile app
-4. The VPN tunnel connects to `YOUR_SERVER_IP:51820/UDP`
+1. Log in to `https://vpn.yourdomain.com`
+2. Click **"+ New Client"** → name it (e.g. `john-laptop`)
+3. Download the `.conf` file or scan the QR code with the WireGuard app
 
-### Client Apps
-- **Windows/macOS**: [wireguard.com/install](https://www.wireguard.com/install/)
-- **iOS/Android**: WireGuard app from App Store / Play Store
-- **Linux**: `apt install wireguard` or `dnf install wireguard-tools`
-
----
-
-## Firewall Rules (UFW / iptables)
-
-```bash
-# Allow WireGuard UDP (required for VPN clients)
-ufw allow 51820/udp
-
-# Allow HTTP/HTTPS for admin panel
-ufw allow 80/tcp
-ufw allow 443/tcp
-
-# Block direct access to internal ports
-ufw deny 51821/tcp    # wg-easy UI — only accessible via Traefik+Authelia
-ufw deny 9091/tcp     # Authelia — only via Traefik
-```
-
----
-
-## Monitoring Integration
-
-Since you're running Zabbix + InfluxDB, wg-easy v15 exposes **Prometheus metrics**:
-
-```yaml
-# Add to wg-easy environment in docker-compose.yml:
-- METRICS_ENABLED=true
-- METRICS_PORT=51822
-```
-
-Scrape from Prometheus/InfluxDB Telegraf:
-```toml
-[[inputs.prometheus]]
-  urls = ["http://wg-easy:51822/metrics"]
-```
+**Client apps:**
+- **Windows / macOS:** [wireguard.com/install](https://www.wireguard.com/install/)
+- **iOS / Android:** WireGuard from App Store / Play Store
+- **Linux:** `apt install wireguard` or `dnf install wireguard-tools`
 
 ---
 
 ## Backup & Recovery
 
 ```bash
-# Full backup (WireGuard config + Authelia DB + config files)
-./scripts/manage.sh backup
-# Saved to: ./backups/YYYYMMDD_HHMMSS/
+vpnstack backup
+# Saved to: /opt/vpnstack/backups/YYYYMMDD_HHMMSS/
 ```
 
-Backups contain:
-- `wireguard.tar.gz` — all WireGuard peer configs and keys
+Each backup contains:
+- `wireguard.tar.gz` — WireGuard peer configs and keys
 - `authelia_config/` — Authelia config + user database
 - `authelia_db.sql.gz` — PostgreSQL dump (TOTP secrets, sessions)
+- `.env.bak` — copy of secrets file
 
 ---
 
 ## File Structure
 
 ```
-vpn-stack/
-├── docker-compose.yml          # Main stack definition
-├── .env.example                # Environment template
-├── .env                        # Your secrets (gitignored!)
-├── .gitignore
+/opt/vpnstack/                      ← default install directory
+├── install.sh                      # Master installer (this script)
+├── docker-compose.yml              # Generated stack definition
+├── .env                            # All secrets (gitignored)
 ├── authelia/
 │   └── config/
-│       ├── configuration.yml   # Authelia config (TOTP, access rules)
-│       ├── users_database.yml  # User accounts + password hashes
-│       └── notifications.txt   # TOTP registration links (filesystem notifier)
+│       ├── configuration.yml       # Authelia settings (TOTP, session, storage)
+│       ├── users_database.yml      # User accounts + Argon2id hashes
+│       └── notifications.txt       # TOTP registration links (filesystem notifier)
 ├── traefik/
 │   ├── config/
-│   │   └── tls.yml             # TLS options
-│   └── certs/                  # TLS certificates (if self-signed)
+│   │   └── tls.yml                 # TLS cipher options and cert paths
+│   └── certs/                      # Self-signed cert or Let's Encrypt acme.json
 ├── scripts/
-│   └── manage.sh               # Setup & management CLI
-└── backups/                    # Auto-created by backup command
+│   └── manage.sh                   # Management CLI (symlinked as /usr/local/bin/vpnstack)
+└── backups/                        # Created by vpnstack backup
 ```
 
 ---
 
 ## Security Notes
 
-- wg-easy's **built-in password is disabled** — access is 100% controlled by Authelia TOTP
-- All internal services are on an **isolated Docker network** (no direct external access)
-- PostgreSQL and Redis are **not exposed** on the host — only accessible within Docker
+- wg-easy's **built-in password is disabled** — access is 100% controlled by Authelia
+- All database/cache services are on an **isolated Docker network** (no external access)
 - Authelia enforces **Argon2id** password hashing (memory-hard, brute-force resistant)
 - TOTP uses **30-second windows** with ±1 skew tolerance for clock drift
-- Session tokens are stored in Redis with configurable **1-hour expiry**
+- Session tokens expire after **1 hour of inactivity**
+- The `STORAGE_ENCRYPTION_KEY` in `.env` **must never change** — it encrypts the TOTP database
+
+---
+
+## Monitoring (Optional)
+
+wg-easy v15 exposes Prometheus metrics. Enable during install or add to `docker-compose.yml`:
+
+```yaml
+- METRICS_ENABLED=true
+- METRICS_PORT=51822
+```
+
+Telegraf / Prometheus scrape endpoint: `http://wg-easy:51822/metrics`
 
 ---
 
 ## Stack Component Versions
 
-| Service    | Image                          | GitHub Stars | License  |
-|------------|-------------------------------|-------------|----------|
-| wg-easy    | `ghcr.io/wg-easy/wg-easy:15`  | ⭐ 24.7k    | MIT      |
-| Authelia   | `authelia/authelia:4.39`      | Actively maintained | Apache 2.0 |
-| Traefik    | `traefik:v3.2`                | ⭐ 54k+     | MIT      |
-| PostgreSQL | `postgres:16-alpine`           | —           | PostgreSQL |
-| Redis      | `redis:7-alpine`               | —           | BSD 3    |
+| Service    | Image                         | Stars   | License    |
+|------------|------------------------------|---------|------------|
+| wg-easy    | `ghcr.io/wg-easy/wg-easy:15` | ⭐ 24.7k | MIT        |
+| Authelia   | `authelia/authelia:4.39`     | Actively maintained | Apache 2.0 |
+| Traefik    | `traefik:v3.2`               | ⭐ 54k+ | MIT        |
+| PostgreSQL | `postgres:16-alpine`          | —       | PostgreSQL |
+| Redis      | `redis:7-alpine`              | —       | BSD 3      |
