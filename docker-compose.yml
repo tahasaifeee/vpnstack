@@ -1,7 +1,9 @@
 ###############################################################################
 # WireGuard VPN Stack with TOTP Auth
-# Components: WireGuard (wg-easy) + Authelia (TOTP) + Traefik + Redis + Postgres
-# GitHub: wg-easy/wg-easy (⭐24.7k) | authelia/authelia (actively maintained)
+# Components: WireGuard (WGDashboard) + Authelia (TOTP) + Traefik + Redis + Postgres
+# GitHub: donaldzou/WGDashboard | authelia/authelia (actively maintained)
+# NOTE: This is the reference/base file. The installer (install.sh) generates
+#       a customised copy at runtime based on your answers (TLS method, TOTP, etc.)
 ###############################################################################
 
 version: "3.9"
@@ -16,7 +18,9 @@ networks:
     internal: true     # No direct internet access for internal services
 
 volumes:
-  wg_data:
+  wgdashboard_conf:    # WireGuard configs (/etc/wireguard)
+  wgdashboard_aconf:   # AmneziaWG configs
+  wgdashboard_data:    # WGDashboard app data + SQLite DB
   authelia_db:
   redis_data:
 
@@ -41,7 +45,7 @@ services:
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.websecure.http.tls=true"
-      # Uncomment for Let's Encrypt (requires public domain):
+      # Uncomment for Let's Encrypt (requires public domain + open port 80):
       # - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       # - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
       # - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
@@ -50,8 +54,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # WireGuard UDP port (not routed through Traefik, directly mapped)
-      - "51820:51820/udp"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/config:/config:ro
@@ -65,7 +67,7 @@ services:
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
       - "traefik.http.routers.traefik-dashboard.middlewares=authelia@docker"
-      # Authelia forward-auth middleware definition (used by all services)
+      # Authelia forward-auth middleware definition (reused by all protected services)
       - "traefik.http.middlewares.authelia.forwardauth.address=http://authelia:9091/api/authz/forward-auth"
       - "traefik.http.middlewares.authelia.forwardauth.trustForwardHeader=true"
       - "traefik.http.middlewares.authelia.forwardauth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
@@ -78,11 +80,12 @@ services:
     container_name: authelia
     restart: unless-stopped
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     environment:
       - TZ=${TZ:-UTC}
-      # Secrets via env (alternatively use Docker secrets)
       - AUTHELIA_JWT_SECRET=${AUTHELIA_JWT_SECRET}
       - AUTHELIA_SESSION_SECRET=${AUTHELIA_SESSION_SECRET}
       - AUTHELIA_STORAGE_ENCRYPTION_KEY=${AUTHELIA_STORAGE_ENCRYPTION_KEY}
@@ -139,50 +142,44 @@ services:
       retries: 5
 
   ##############################################################################
-  # WG-EASY - WireGuard VPN + Admin Panel
-  # Admin panel is protected behind Authelia (TOTP required to access)
+  # WGDASHBOARD - WireGuard VPN + Web Admin Panel
+  # Admin panel is protected behind Authelia (TOTP at Traefik edge).
+  # WGDashboard also has its own login (username/password) — defence in depth.
+  # Access flow: vpn.domain.com → Traefik → Authelia (TOTP) → WGDashboard login
   ##############################################################################
-  wg-easy:
-    image: ghcr.io/wg-easy/wg-easy:15
-    container_name: wg-easy
+  wgdashboard:
+    image: ghcr.io/wgdashboard/wgdashboard:latest
+    container_name: wgdashboard
     restart: unless-stopped
     depends_on:
       - traefik
       - authelia
     environment:
-      - LANG=en
-      - WG_HOST=${VPN_HOST}           # Your server's public IP or domain
-      - WG_PORT=51820                 # WireGuard UDP port
-      - PORT=51821                    # Web UI port (internal)
-      - WG_DEFAULT_DNS=${WG_DNS:-1.1.1.1}
-      - WG_ALLOWED_IPS=${WG_ALLOWED_IPS:-0.0.0.0/0}
-      - WG_DEFAULT_ADDRESS=10.8.0.x
-      - WG_PERSISTENT_KEEPALIVE=25
-      - UI_TRAFFIC_STATS=true
-      - UI_CHART_TYPE=1               # 0=none, 1=line, 2=area, 3=bar
-      # NOTE: wg-easy's built-in password is DISABLED here
-      # Access is controlled entirely by Authelia TOTP
-      - INSECURE=false
+      - tz=${TZ:-UTC}
+      - public_ip=${VPN_HOST}           # Server's public IP shown to WireGuard clients
+      - username=${WGD_USERNAME}        # WGDashboard admin username
+      - password=${WGD_PASSWORD}        # Plain text — bcrypt-hashed by container on startup
+      - wgd_port=10086                  # Internal web UI port
+      - wg_port=51820                   # WireGuard UDP port
+      - global_dns=${WG_DNS:-1.1.1.1}  # DNS pushed to WireGuard clients
+      - out_adapt=${WG_IFACE:-eth0}     # Outbound interface for NAT masquerading
+      - wg_autostart=true               # Auto-start wg0 interface on container boot
+      - enable_totp=false               # Disabled — Authelia handles TOTP at the edge
     volumes:
-      - wg_data:/etc/wireguard
-      - /lib/modules:/lib/modules:ro
+      - wgdashboard_conf:/etc/wireguard           # WireGuard configs and keys
+      - wgdashboard_aconf:/etc/amnezia/amneziawg  # AmneziaWG configs
+      - wgdashboard_data:/data                     # App data, SQLite DB, INI config
     cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
+      - NET_ADMIN          # Required for creating/managing WireGuard interfaces
     networks:
       - proxy
     ports:
-      - "51820:51820/udp"             # WireGuard tunnel port (direct, no proxy)
+      - "51820:51820/udp"  # WireGuard tunnel (direct, not proxied through Traefik)
     expose:
-      - "51821"                       # Web UI only via Traefik+Authelia
+      - "10086"            # Web UI — only reachable via Traefik + Authelia
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.wg-easy.rule=Host(`vpn.${DOMAIN}`)"
-      - "traefik.http.routers.wg-easy.entrypoints=websecure"
-      - "traefik.http.routers.wg-easy.middlewares=authelia@docker"   # ← TOTP enforced here
-      - "traefik.http.services.wg-easy.loadbalancer.server.port=51821"
+      - "traefik.http.routers.wgdashboard.rule=Host(`vpn.${DOMAIN}`)"
+      - "traefik.http.routers.wgdashboard.entrypoints=websecure"
+      - "traefik.http.routers.wgdashboard.middlewares=authelia@docker"   # ← Authelia gate
+      - "traefik.http.services.wgdashboard.loadbalancer.server.port=10086"

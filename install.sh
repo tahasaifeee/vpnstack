@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPN Stack Master Installer v1.0
-# Components: WireGuard (wg-easy) + Authelia + Traefik + PostgreSQL + Redis
+# VPN Stack Master Installer v1.1
+# Components: WireGuard (WGDashboard) + Authelia + Traefik + PostgreSQL + Redis
 # Supported:  Ubuntu 20+, Debian 11+, AlmaLinux/Rocky/RHEL 8+, CentOS Stream, Fedora
 # One-liner:  curl -fsSL https://raw.githubusercontent.com/tahasaifeee/vpnstack/main/install.sh | sudo bash
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ── Constants ─────────────────────────────────────────────────────────────────
 INSTALL_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
 LOG_FILE="/tmp/vpnstack-install.log"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 MIN_DOCKER_MAJOR=24
 
 # ── Colors (disabled when not a terminal) ────────────────────────────────────
@@ -196,15 +196,16 @@ gather_config() {
     ask ACME_EMAIL "Email for Let's Encrypt" "$ADMIN_EMAIL"
   fi
 
-  # WireGuard
-  ask WG_DNS         "WireGuard client DNS"       "1.1.1.1,8.8.8.8"
-  ask WG_ALLOWED_IPS "WireGuard allowed IPs"      "0.0.0.0/0"
+  # WireGuard / WGDashboard
+  ask WG_DNS "WireGuard client DNS servers" "1.1.1.1,8.8.8.8"
+
+  # Outbound network interface (for NAT masquerading in WireGuard)
+  local default_iface
+  default_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1 || echo "eth0")
+  ask WG_IFACE "Outbound network interface (for NAT)" "$default_iface"
 
   # Firewall
   ask_yn SETUP_FIREWALL "Configure firewall rules automatically" "y"
-
-  # Monitoring (optional Prometheus metrics)
-  ask_yn ENABLE_METRICS "Enable Prometheus metrics on wg-easy" "n"
 
   # Summary
   echo
@@ -213,8 +214,9 @@ gather_config() {
   printf "  %-28s ${CYAN}%s${RESET}\n" "Auth Portal:"     "https://auth.${DOMAIN}"
   printf "  %-28s %s\n"                "WireGuard Host:"  "${VPN_HOST}:51820/UDP"
   printf "  %-28s %s\n"                "Admin User:"      "${ADMIN_USERNAME} (${ADMIN_EMAIL})"
-  printf "  %-28s %s\n"                "TOTP:"            "$ENABLE_TOTP"
+  printf "  %-28s %s\n"                "Authelia TOTP:"   "$ENABLE_TOTP"
   printf "  %-28s %s\n"                "TLS:"             "$TLS_METHOD"
+  printf "  %-28s %s\n"                "Outbound iface:"  "$WG_IFACE"
   printf "  %-28s %s\n"                "Install Dir:"     "$INSTALL_DIR"
   echo
   ask_yn CONFIRM "Proceed with installation" "y"
@@ -246,9 +248,13 @@ DOMAIN=${DOMAIN}
 VPN_HOST=${VPN_HOST}
 TZ=${TZ}
 
+# WGDashboard admin credentials (plain text — hashed by container on startup)
+WGD_USERNAME=${ADMIN_USERNAME}
+WGD_PASSWORD=${ADMIN_PASSWORD}
+
 # WireGuard
 WG_DNS=${WG_DNS}
-WG_ALLOWED_IPS=${WG_ALLOWED_IPS}
+WG_IFACE=${WG_IFACE}
 
 # Authelia Secrets  ── DO NOT CHANGE after first run (corrupts DB)
 AUTHELIA_JWT_SECRET=${JWT_SECRET}
@@ -270,21 +276,15 @@ EOF
 generate_compose() {
   section "Generating docker-compose.yml"
 
-  # Build up the Traefik ACME lines and wg-easy middleware label
-  local acme_lines="" wg_middleware_label=""
+  # Build up the Traefik ACME lines and WGDashboard middleware label
+  local acme_lines="" wgd_middleware_label=""
   if [[ "$TLS_METHOD" == "letsencrypt" ]]; then
     acme_lines='      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"'
   fi
-  if [[ "$ENABLE_TOTP" == "y" ]]; then
-    wg_middleware_label='      - "traefik.http.routers.wg-easy.middlewares=authelia@docker"'
-  fi
-  local metrics_env=""
-  if [[ "$ENABLE_METRICS" == "y" ]]; then
-    metrics_env='      - METRICS_ENABLED=true
-      - METRICS_PORT=51822'
-  fi
+  # Authelia middleware always applied — TOTP toggle controls Authelia's policy, not this
+  wgd_middleware_label='      - "traefik.http.routers.wgdashboard.middlewares=authelia@docker"'
 
   # Write compose file — use printf to avoid heredoc variable-expansion issues
   cat > "${INSTALL_DIR}/docker-compose.yml" <<'BASEEOF'
@@ -300,7 +300,9 @@ networks:
     internal: true
 
 volumes:
-  wg_data:
+  wgdashboard_conf:
+  wgdashboard_aconf:
+  wgdashboard_data:
   authelia_db:
   redis_data:
 
@@ -411,65 +413,48 @@ BASEEOF
       timeout: 5s
       retries: 5
 
-  wg-easy:
-    image: ghcr.io/wg-easy/wg-easy:15
-    container_name: wg-easy
+  wgdashboard:
+    image: ghcr.io/wgdashboard/wgdashboard:latest
+    container_name: wgdashboard
     restart: unless-stopped
     depends_on:
       - traefik
       - authelia
     environment:
-      - LANG=en
-      - WG_HOST=${VPN_HOST}
-      - WG_PORT=51820
-      - PORT=51821
-      - WG_DEFAULT_DNS=${WG_DNS:-1.1.1.1}
-      - WG_ALLOWED_IPS=${WG_ALLOWED_IPS:-0.0.0.0/0}
-      - WG_DEFAULT_ADDRESS=10.8.0.x
-      - WG_PERSISTENT_KEEPALIVE=25
-      - UI_TRAFFIC_STATS=true
-      - UI_CHART_TYPE=1
-      - INSECURE=false
-EOF
-
-  # Append metrics env vars if enabled
-  if [[ -n "$metrics_env" ]]; then
-    echo "$metrics_env" >> "${INSTALL_DIR}/docker-compose.yml"
-  fi
-
-  cat >> "${INSTALL_DIR}/docker-compose.yml" <<'EOF'
+      - tz=${TZ:-UTC}
+      - public_ip=${VPN_HOST}
+      - username=${WGD_USERNAME}
+      - password=${WGD_PASSWORD}
+      - wgd_port=10086
+      - wg_port=51820
+      - global_dns=${WG_DNS:-1.1.1.1}
+      - out_adapt=${WG_IFACE:-eth0}
+      - wg_autostart=true
+      - enable_totp=false
     volumes:
-      - wg_data:/etc/wireguard
-      - /lib/modules:/lib/modules:ro
+      - wgdashboard_conf:/etc/wireguard
+      - wgdashboard_aconf:/etc/amnezia/amneziawg
+      - wgdashboard_data:/data
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
     networks:
       - proxy
     ports:
       - "51820:51820/udp"
     expose:
-      - "51821"
+      - "10086"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.wg-easy.rule=Host(`vpn.${DOMAIN}`)"
-      - "traefik.http.routers.wg-easy.entrypoints=websecure"
+      - "traefik.http.routers.wgdashboard.rule=Host(`vpn.${DOMAIN}`)"
+      - "traefik.http.routers.wgdashboard.entrypoints=websecure"
 EOF
 
-  # Auth middleware (only if TOTP / Authelia protection is enabled)
-  if [[ -n "$wg_middleware_label" ]]; then
-    echo "$wg_middleware_label" >> "${INSTALL_DIR}/docker-compose.yml"
-  fi
-
-  echo '      - "traefik.http.services.wg-easy.loadbalancer.server.port=51821"' \
+  # Authelia middleware always applied (TOTP level controlled by Authelia policy)
+  echo "$wgd_middleware_label" >> "${INSTALL_DIR}/docker-compose.yml"
+  echo '      - "traefik.http.services.wgdashboard.loadbalancer.server.port=10086"' \
     >> "${INSTALL_DIR}/docker-compose.yml"
 
-  log "docker-compose.yml generated (TLS: ${TLS_METHOD}, TOTP: ${ENABLE_TOTP})"
+  log "docker-compose.yml generated (TLS: ${TLS_METHOD}, Authelia TOTP: ${ENABLE_TOTP})"
 }
 
 # ── Authelia configuration.yml ────────────────────────────────────────────────
@@ -671,7 +656,7 @@ case "$CMD" in
   status)
     docker compose ps
     echo; echo "=== Container Health ==="
-    for c in traefik authelia authelia-redis authelia-postgres wg-easy; do
+    for c in traefik authelia authelia-redis authelia-postgres wgdashboard; do
       s=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$c" 2>/dev/null || echo "not found")
       printf "  %-25s %s\n" "$c:" "$s"
     done ;;
@@ -706,8 +691,10 @@ UEOF
     docker exec authelia-postgres pg_dump -U authelia authelia \
       | gzip > "${dest}/authelia_db.sql.gz"
     cp -r authelia/config "${dest}/authelia_config"
-    docker run --rm -v wg_data:/data -v "$(pwd)/${dest}":/backup \
+    docker run --rm -v wgdashboard_conf:/data -v "$(pwd)/${dest}":/backup \
       alpine tar czf /backup/wireguard.tar.gz -C /data .
+    docker run --rm -v wgdashboard_data:/data -v "$(pwd)/${dest}":/backup \
+      alpine tar czf /backup/wgdashboard_data.tar.gz -C /data .
     cp .env "${dest}/.env.bak"
     echo "Backup saved to: ${dest}"; ls -lh "${dest}/" ;;
   update)
@@ -731,9 +718,9 @@ setup_firewall() {
     ufw allow 22/tcp    comment "SSH"               >>"$LOG_FILE" 2>&1
     ufw allow 80/tcp    comment "HTTP (Traefik)"    >>"$LOG_FILE" 2>&1
     ufw allow 443/tcp   comment "HTTPS (Traefik)"   >>"$LOG_FILE" 2>&1
-    ufw allow 51820/udp comment "WireGuard"         >>"$LOG_FILE" 2>&1
-    ufw deny  51821/tcp comment "wg-easy UI (internal)" >>"$LOG_FILE" 2>&1 || true
-    ufw deny  9091/tcp  comment "Authelia (internal)"   >>"$LOG_FILE" 2>&1 || true
+    ufw allow 51820/udp comment "WireGuard"              >>"$LOG_FILE" 2>&1
+    ufw deny  10086/tcp comment "WGDashboard (internal)" >>"$LOG_FILE" 2>&1 || true
+    ufw deny  9091/tcp  comment "Authelia (internal)"    >>"$LOG_FILE" 2>&1 || true
     ufw reload                                      >>"$LOG_FILE" 2>&1 || true
     log "UFW rules applied"
   elif command -v firewall-cmd &>/dev/null; then
@@ -761,18 +748,19 @@ start_stack() {
 # ── Health Check ──────────────────────────────────────────────────────────────
 health_check() {
   section "Waiting for Services"
-  local elapsed=0 interval=5 timeout=120
+  local elapsed=0 interval=5 timeout=180
   while [[ $elapsed -lt $timeout ]]; do
-    local pg_health
+    local pg_health wgd_health
     pg_health=$(docker inspect --format='{{.State.Health.Status}}' authelia-postgres 2>/dev/null || echo "unknown")
-    if [[ "$pg_health" == "healthy" ]]; then
-      log "Services healthy (${elapsed}s elapsed)"
+    wgd_health=$(docker inspect --format='{{.State.Health.Status}}' wgdashboard 2>/dev/null || echo "unknown")
+    if [[ "$pg_health" == "healthy" && "$wgd_health" == "healthy" ]]; then
+      log "All services healthy (${elapsed}s elapsed)"
       return 0
     fi
     sleep "$interval"; elapsed=$((elapsed + interval))
-    info "Waiting... ${elapsed}/${timeout}s (postgres: ${pg_health})"
+    info "Waiting... ${elapsed}/${timeout}s  (postgres: ${pg_health}, wgdashboard: ${wgd_health})"
   done
-  warn "Timed out — services may still be starting. Check: vpnstack status"
+  warn "Timed out — services may still be initialising. Check: vpnstack status"
   docker compose -f "${INSTALL_DIR}/docker-compose.yml" ps
 }
 
@@ -796,11 +784,14 @@ print_summary() {
   echo -e "${BOLD}First Login:${RESET}"
   echo    "  1. Create the DNS records above"
   echo    "  2. Open https://vpn.${DOMAIN}"
-  echo    "  3. Log in: ${ADMIN_USERNAME} / <your password>"
+  echo    "  3. Traefik forwards to Authelia — log in: ${ADMIN_USERNAME} / <your password>"
   if [[ "$ENABLE_TOTP" == "y" ]]; then
-  echo    "  4. Scan the TOTP QR code with Google Authenticator"
-  echo    "  5. Enter the 6-digit code — you're in!"
+  echo    "  4. Scan the TOTP QR code with Google Authenticator and confirm"
   fi
+  echo    "  $([ "$ENABLE_TOTP" == "y" ] && echo 5 || echo 4). WGDashboard login appears — use the same credentials: ${ADMIN_USERNAME} / <your password>"
+  echo    "  → You're in! Click 'New Configuration' to create a WireGuard interface."
+  echo
+  echo -e "${YELLOW}Note:${RESET} Two login steps by design — Authelia gate (TOTP) + WGDashboard (password)."
   echo
   echo -e "${BOLD}Common Commands:${RESET}"
   echo    "  vpnstack status"
@@ -832,7 +823,7 @@ main() {
   echo "  ╚████╔╝ ██║     ██║ ╚████║    ███████║   ██║   ██║  ██║╚██████╗██║  ██╗"
   echo "   ╚═══╝  ╚═╝     ╚═╝  ╚═══╝    ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo "  WireGuard + Authelia TOTP + Traefik | v${SCRIPT_VERSION}"
+  echo "  WireGuard (WGDashboard) + Authelia TOTP + Traefik | v${SCRIPT_VERSION}"
   echo "  Log: ${LOG_FILE}"
   echo
 

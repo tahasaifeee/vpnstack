@@ -1,6 +1,6 @@
 # WireGuard VPN Stack with TOTP Authentication
 
-A production-ready, self-hosted VPN stack combining **WireGuard** (via wg-easy), **Authelia** (TOTP/2FA), **Traefik** (reverse proxy + TLS), **PostgreSQL**, and **Redis** — all in Docker Compose.
+A production-ready, self-hosted VPN stack combining **WireGuard** (via [WGDashboard](https://github.com/donaldzou/WGDashboard)), **Authelia** (TOTP/2FA), **Traefik** (reverse proxy + TLS), **PostgreSQL**, and **Redis** — all in Docker Compose.
 
 ---
 
@@ -28,9 +28,10 @@ The installer will ask you:
 | Server public IP / hostname | Auto-detected |
 | Timezone | System timezone |
 | Admin username & password | `admin` |
-| Enable TOTP two-factor auth? | Yes |
+| Enable Authelia TOTP two-factor auth? | Yes |
 | TLS method (Let's Encrypt or self-signed) | Let's Encrypt |
-| WireGuard DNS servers | `1.1.1.1, 8.8.8.8` |
+| WireGuard client DNS servers | `1.1.1.1, 8.8.8.8` |
+| Outbound network interface (for NAT) | Auto-detected |
 | Configure firewall automatically? | Yes |
 
 It then generates all config files, hashes your password with Argon2id, issues/downloads TLS certs, and starts the full stack — no manual editing required.
@@ -55,8 +56,9 @@ Internet User
     │         │   [Redis]   [PostgreSQL]
     │         │   Sessions    TOTP secrets
     │         │
-    └──► [wg-easy :51821]         vpn.yourdomain.com  ← Protected by Authelia TOTP
-              │  (Admin panel: create/manage WireGuard peers)
+    └──► [WGDashboard :10086]     vpn.yourdomain.com  ← Protected by Authelia TOTP
+              │  (Admin panel: create/manage WireGuard interfaces & peers)
+              │  (Has its own login page after Authelia — defence in depth)
               │
     ┌─────────┘
 [WireGuard :51820/UDP]   ← Direct UDP, VPN clients connect here
@@ -65,7 +67,7 @@ Internet User
 ```
 
 **Networks:**
-- `proxy` — Traefik, wg-easy, Authelia (internet-facing)
+- `proxy` — Traefik, WGDashboard, Authelia (internet-facing)
 - `vpn_internal` — PostgreSQL, Redis (no direct internet access)
 
 ---
@@ -97,11 +99,13 @@ Create three A records pointing to your server IP:
 ### First Login
 
 1. Open `https://vpn.yourdomain.com`
-2. You're redirected to `https://auth.yourdomain.com`
-3. Log in with your admin username and password
-4. If TOTP is enabled: scan the QR code with **Google Authenticator** (or Authy/1Password)
-5. Enter the 6-digit code — you're now in the **wg-easy admin panel**
-6. Click **"+ New Client"** to create your first VPN peer
+2. You're redirected to Authelia — log in with your admin username and password
+3. If TOTP is enabled: scan the QR code with **Google Authenticator** (or Authy/1Password) and enter the 6-digit code
+4. WGDashboard's own login appears — use the **same admin credentials** again
+5. You're in the **WGDashboard admin panel**
+6. Click **"New Configuration"** to create a WireGuard interface (e.g. `wg0`), then add peers
+
+> **Why two logins?** Authelia acts as a TOTP gate at the Traefik edge. WGDashboard has its own login for defence-in-depth. Both use the same credentials you set during install.
 
 ---
 
@@ -167,9 +171,10 @@ They'll be prompted to register a new TOTP device on next login.
 
 ## WireGuard Client Setup
 
-1. Log in to `https://vpn.yourdomain.com`
-2. Click **"+ New Client"** → name it (e.g. `john-laptop`)
-3. Download the `.conf` file or scan the QR code with the WireGuard app
+1. Log in to `https://vpn.yourdomain.com` (Authelia → WGDashboard)
+2. If no interface exists yet: click **"New Configuration"** → name it `wg0`, set network `10.0.0.1/24`, save
+3. In the interface panel click **"New Peer"** → name it (e.g. `john-laptop`)
+4. Download the `.conf` file or scan the QR code with the WireGuard app
 
 **Client apps:**
 - **Windows / macOS:** [wireguard.com/install](https://www.wireguard.com/install/)
@@ -242,10 +247,10 @@ Telegraf / Prometheus scrape endpoint: `http://wg-easy:51822/metrics`
 
 ## Stack Component Versions
 
-| Service    | Image                         | Stars   | License    |
-|------------|------------------------------|---------|------------|
-| wg-easy    | `ghcr.io/wg-easy/wg-easy:15` | ⭐ 24.7k | MIT        |
-| Authelia   | `authelia/authelia:4.39`     | Actively maintained | Apache 2.0 |
-| Traefik    | `traefik:v3.2`               | ⭐ 54k+ | MIT        |
-| PostgreSQL | `postgres:16-alpine`          | —       | PostgreSQL |
-| Redis      | `redis:7-alpine`              | —       | BSD 3      |
+| Service       | Image                                     | Stars   | License    |
+|---------------|------------------------------------------|---------|------------|
+| WGDashboard   | `ghcr.io/wgdashboard/wgdashboard:latest` | ⭐ 5k+  | Apache 2.0 |
+| Authelia      | `authelia/authelia:4.39`                 | Actively maintained | Apache 2.0 |
+| Traefik       | `traefik:v3.2`                           | ⭐ 54k+ | MIT        |
+| PostgreSQL    | `postgres:16-alpine`                      | —       | PostgreSQL |
+| Redis         | `redis:7-alpine`                          | —       | BSD 3      |
