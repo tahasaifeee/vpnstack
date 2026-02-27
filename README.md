@@ -191,10 +191,11 @@ vpnstack backup
 ```
 
 Each backup contains:
-- `wireguard.tar.gz` — WireGuard peer configs and keys
+- `wireguard.tar.gz` — WireGuard peer configs and private keys (`wgdashboard_conf` volume)
+- `wgdashboard_data.tar.gz` — WGDashboard app database and settings (`wgdashboard_data` volume)
 - `authelia_config/` — Authelia config + user database
 - `authelia_db.sql.gz` — PostgreSQL dump (TOTP secrets, sessions)
-- `.env.bak` — copy of secrets file
+- `.env.bak` — copy of all secrets and environment variables
 
 ---
 
@@ -223,25 +224,54 @@ Each backup contains:
 
 ## Security Notes
 
-- wg-easy's **built-in password is disabled** — access is 100% controlled by Authelia
-- All database/cache services are on an **isolated Docker network** (no external access)
-- Authelia enforces **Argon2id** password hashing (memory-hard, brute-force resistant)
-- TOTP uses **30-second windows** with ±1 skew tolerance for clock drift
-- Session tokens expire after **1 hour of inactivity**
-- The `STORAGE_ENCRYPTION_KEY` in `.env` **must never change** — it encrypts the TOTP database
+### Authentication layers
+- **Two-layer protection:** Authelia (TOTP gate at Traefik edge) + WGDashboard (own login) — neither layer alone is a single point of failure
+- Authelia enforces **Argon2id** password hashing (memory-hard, GPU-resistant) for user accounts
+- WGDashboard hashes its admin password with **bcrypt** (12 rounds) on container startup — the plain text value in `.env` is only used once at init; keep `.env` permissions at `600`
+- TOTP uses **30-second windows** with ±1 skew tolerance for minor clock drift
+- Authelia **brute-force regulation:** locks account after 5 failed attempts for 10 minutes
+- Authelia session tokens expire after **1 hour of inactivity** (stored in Redis, not browser)
+
+### Secrets & keys
+- The `AUTHELIA_STORAGE_ENCRYPTION_KEY` in `.env` encrypts **all Authelia storage** (TOTP secrets, session data) — changing it after first run permanently corrupts the database
+- `AUTHELIA_JWT_SECRET` and `AUTHELIA_SESSION_SECRET` must also remain stable across restarts
+- WireGuard private keys are stored inside the `wgdashboard_conf` Docker volume — back them up with `vpnstack backup`
+
+### Network isolation
+- PostgreSQL and Redis are on the `vpn_internal` network — **not reachable from the internet or the proxy network**
+- WGDashboard's web UI (port `10086`) is exposed only inside Docker — Traefik is the sole entry point
+- Authelia's API (port `9091`) is similarly internal-only
+- Firewall blocks direct access to ports `10086` and `9091`; only `80`, `443`, and `51820/udp` are open externally
+
+### TLS
+- Traefik enforces **TLS 1.2+** with strong cipher suites (ChaCha20-Poly1305, AES-256-GCM)
+- All HTTP traffic on port 80 is permanently redirected to HTTPS
+- Self-signed certs: valid for 10 years, wildcard `*.yourdomain.com` — accept once in browser
+- Let's Encrypt certs: auto-renewed by Traefik before expiry
 
 ---
 
 ## Monitoring (Optional)
 
-wg-easy v15 exposes Prometheus metrics. Enable during install or add to `docker-compose.yml`:
+### Docker-native
 
-```yaml
-- METRICS_ENABLED=true
-- METRICS_PORT=51822
+```bash
+vpnstack status                        # Health status of all containers
+vpnstack logs wgdashboard             # WGDashboard logs
+docker stats                           # Live CPU/memory/network per container
 ```
 
-Telegraf / Prometheus scrape endpoint: `http://wg-easy:51822/metrics`
+### Traefik dashboard
+
+The Traefik dashboard at `https://traefik.yourdomain.com` shows real-time request routing, TLS cert status, middleware chains, and service health — protected by Authelia.
+
+### Authelia metrics
+
+Authelia exposes a Prometheus-compatible metrics endpoint internally. To scrape it, add a Prometheus job targeting `http://authelia:9091/metrics` from within the `vpn_internal` network.
+
+### WireGuard peer traffic
+
+WGDashboard displays per-peer traffic stats and connection status directly in its admin panel at `https://vpn.yourdomain.com`. No external tool needed for basic visibility.
 
 ---
 
